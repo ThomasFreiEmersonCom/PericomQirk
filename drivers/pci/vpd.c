@@ -166,6 +166,44 @@ static int pci_vpd_wait(struct pci_dev *dev)
 	return -ETIMEDOUT;
 }
 
+#define pericomUART_VPD_ADDR_F 0x0001
+static int pericomUART_vpd_wait(struct pci_dev *dev)
+{
+	struct pci_vpd *vpd = dev->vpd;
+	unsigned long timeout = jiffies + msecs_to_jiffies(125);
+	unsigned long max_sleep = 16;
+	u16 status;
+	int ret;
+
+	if (!vpd->busy)
+		return 0;
+
+	do {
+		ret = pci_user_read_config_word(dev, vpd->cap + PCI_VPD_ADDR,
+						&status);
+		if (ret < 0)
+			return ret;
+
+		if ((status & pericomUART_VPD_ADDR_F) == vpd->flag) {
+			vpd->busy = 0;
+			return 0;
+		}
+
+		if (fatal_signal_pending(current))
+			return -EINTR;
+
+		if (time_after(jiffies, timeout))
+			break;
+
+		usleep_range(10, max_sleep);
+		if (max_sleep < 1024)
+			max_sleep *= 2;
+	} while (true);
+
+	pci_warn(dev, "VPD access failed.  This is likely a firmware bug on this device.  Contact the card vendor for a firmware update\n");
+	return -ETIMEDOUT;
+}
+
 static ssize_t pci_vpd_read(struct pci_dev *dev, loff_t pos, size_t count,
 			    void *arg)
 {
@@ -233,6 +271,80 @@ out:
 	return ret ? ret : count;
 }
 
+/*
+ * read VPD data in 2 chuncs of 16 bit because of known bug in pericom
+ * controller. Bit 16 always reads the value of bit 0 due to a chip
+ * bug. See erata E4 from 6/8/2018 revision 1.1
+*/
+#define pericomUART_VPD_START 0x0001
+#define pericomUART_VPD_WRITE 0x0002
+#define pericomUART_VPD_WORD_ADDR  2
+#define pericomUART_VPD_DWORD_ADDR 3
+static ssize_t pericomUART_vpd_read(struct pci_dev *dev, loff_t pos, size_t count,
+			    void *arg)
+{
+	struct pci_vpd *vpd = dev->vpd;
+	int ret = 0;
+	loff_t end = pos + count;
+	u8 *buf = arg;
+
+    if (pos < 0)
+		return -EINVAL;
+
+	if (!vpd->valid) {
+		vpd->valid = 1;
+		vpd->len = pci_vpd_size(dev, vpd->len);
+	}
+ 	if (vpd->len == 0)
+		return -EIO;
+
+	if (pos > vpd->len)
+		return 0;
+
+	if (end > vpd->len) {
+		end = vpd->len;
+		count = end - pos;
+	}
+
+	if (mutex_lock_killable(&vpd->lock))
+		return -EINTR;
+
+	ret = pci_vpd_wait(dev);
+	if (ret < 0)
+		goto out;
+	
+ 	while (pos < end) {
+		u16 val;
+		unsigned int i, skip;
+
+		ret = pci_user_write_config_word(dev, vpd->cap + PCI_VPD_ADDR,
+						 ((pos / 2) << pericomUART_VPD_WORD_ADDR) | pericomUART_VPD_START);
+		if (ret < 0)
+			break;
+		vpd->busy = 1;
+		vpd->flag = 0; 		
+		ret = pericomUART_vpd_wait(dev);
+		if (ret < 0)
+			break;
+		ret = pci_user_read_config_word(dev, vpd->cap + PCI_VPD_DATA, &val);
+		if (ret < 0)
+			break;
+
+		skip = pos & 1;
+		for (i = 0;  i < sizeof(u16); i++) {
+			if (i >= skip) {
+				*buf++ = val;
+				if (++pos == end)
+					break;
+			}
+			val >>= 8;
+		}
+	}
+out: 
+	mutex_unlock(&vpd->lock);
+	return ret ? ret : count;
+}
+
 static ssize_t pci_vpd_write(struct pci_dev *dev, loff_t pos, size_t count,
 			     const void *arg)
 {
@@ -291,10 +403,80 @@ out:
 	return ret ? ret : count;
 }
 
+static ssize_t pericomUART_vpd_write(struct pci_dev *dev, loff_t pos, size_t count,
+			     const void *arg)
+{
+	struct pci_vpd *vpd = dev->vpd;
+	const u8 *buf = arg;
+	loff_t end = pos + count;
+	int ret = 0;
+
+	if (pos < 0 || (pos & 3) || (count & 3))
+		return -EINVAL;
+
+	if (!vpd->valid) {
+		vpd->valid = 1;
+		vpd->len = pci_vpd_size(dev, vpd->len);
+	}
+
+	if (vpd->len == 0)
+		return -EIO;
+	
+ 	if (end > vpd->len)
+		return -EINVAL;
+
+	if (mutex_lock_killable(&vpd->lock))
+		return -EINTR;
+
+	ret = pci_vpd_wait(dev);
+	if (ret < 0)
+		goto out;
+ 
+ while (pos < end) {
+		u32 val;
+
+		val = *buf++;
+		val |= *buf++ << 8;
+		val |= *buf++ << 16;
+		val |= *buf++ << 24; 
+
+		ret = pci_user_write_config_dword(dev, vpd->cap + PCI_VPD_DATA, val);
+		if (ret < 0)
+			break;
+		ret = pci_user_write_config_word(dev, vpd->cap + PCI_VPD_ADDR,
+						 (((pos / 4) << pericomUART_VPD_DWORD_ADDR) & ~3) | pericomUART_VPD_WRITE | pericomUART_VPD_START);
+		if (ret < 0)
+			break;
+
+		vpd->busy = 1;
+		vpd->flag = 0; 
+		ret = pericomUART_vpd_wait(dev);
+		if (ret < 0)
+			break;
+
+        pos += sizeof(u32);
+	}
+out: 
+	mutex_unlock(&vpd->lock);
+	return ret ? ret : count;
+}
+
 static const struct pci_vpd_ops pci_vpd_ops = {
 	.read = pci_vpd_read,
 	.write = pci_vpd_write,
 };
+
+static const struct pci_vpd_ops pericomUART_vpd_ops = {
+	.read = pericomUART_vpd_read,
+	.write = pericomUART_vpd_write,
+//	.set_size = pci_vpd_set_size,
+};
+
+void quirk_pericom_PI7C9X795x(struct pci_dev *pdev)
+{
+  printk("Quirk_Pericom called...");
+  pdev->vpd->ops = (const struct pci_vpd_ops*) &pericomUART_vpd_ops;
+}
 
 static ssize_t pci_vpd_f0_read(struct pci_dev *dev, loff_t pos, size_t count,
 			       void *arg)
@@ -529,5 +711,12 @@ static void quirk_chelsio_extend_vpd(struct pci_dev *dev)
 
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_CHELSIO, PCI_ANY_ID,
 			quirk_chelsio_extend_vpd);
+
+/* Pericom PI7C9X795x controller doesn't match PCI spec for vpd */
+void quirk_pericom_PI7C9X795x(struct pci_dev *pdev);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_PERICOM, PCI_DEVICE_ID_PERICOM_PI7C9X7951, quirk_pericom_PI7C9X795x);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_PERICOM, PCI_DEVICE_ID_PERICOM_PI7C9X7952, quirk_pericom_PI7C9X795x);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_PERICOM, PCI_DEVICE_ID_PERICOM_PI7C9X7954, quirk_pericom_PI7C9X795x);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_PERICOM, PCI_DEVICE_ID_PERICOM_PI7C9X7958, quirk_pericom_PI7C9X795x);
 
 #endif
